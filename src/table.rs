@@ -66,7 +66,7 @@ impl<K: Eq + Hash, V, R: BuildHasher + Clone> Table<K, V, R> {
     let hash = self.hash_u64(&key);
     let group_index = h1(hash) % self.groups.len();
 
-    println!("<insert> hash: {}, h1: {}, h2: {}, group_index: {}, capacity: {}", hash, h1(hash), h2(hash), group_index, self.capacity);
+    // println!("<insert> hash: {}, h1: {}, h2: {}, group_index: {}, capacity: {}", hash, h1(hash), h2(hash), group_index, self.capacity);
 
     // Translate group index to control byte index
     let mut current_control_byte_idx = group_index * GROUP_SIZE;
@@ -78,12 +78,12 @@ impl<K: Eq + Hash, V, R: BuildHasher + Clone> Table<K, V, R> {
       if let Some(idx_in_group) = idx_in_group {
         // Found an empty slot or deleted slot, insert the item
         let update_group_idx = current_control_byte_idx / GROUP_SIZE;
-        println!("found empty slot at group_idx: {} idx: {}", update_group_idx, idx_in_group);
+        // println!("found empty slot at group_idx: {} idx: {}", update_group_idx, idx_in_group);
         self.groups[update_group_idx].items[idx_in_group].write(Item::new(hash, key, value));
         self.control_bytes[current_control_byte_idx + idx_in_group] = h2(hash);
         self.size += 1;
         if self.load_factor() > GROWTH_FACTOR_THRESHOLD {
-          println!("growing table");
+          // println!("growing table");
           self.grow();
         }
         break;
@@ -93,11 +93,11 @@ impl<K: Eq + Hash, V, R: BuildHasher + Clone> Table<K, V, R> {
     }
   }
 
-  pub fn get(&self, item: &K) -> Option<&V> {
-    let hash = self.hash_u64(item);
+  pub fn get(&self, key: &K) -> Option<&V> {
+    let hash = self.hash_u64(key);
     let group_idx = h1(hash) % self.groups.len();
 
-    println!("<get> hash: {}, h1: {}, h2: {}, group_idx: {}", hash, h1(hash), h2(hash), group_idx);
+    // println!("<get> hash: {}, h1: {}, h2: {}, group_idx: {}", hash, h1(hash), h2(hash), group_idx);
 
     // Translate group index to control byte index
     let mut current_control_byte_idx = group_idx * GROUP_SIZE;
@@ -108,24 +108,37 @@ impl<K: Eq + Hash, V, R: BuildHasher + Clone> Table<K, V, R> {
       let idx_in_group = self.probe_for_item(view, h2(hash));
 
       if let Some(idx_in_group) = idx_in_group {
-        // Found the item
+        // Found the item with same hash
         let update_group_idx = current_control_byte_idx / GROUP_SIZE;
-        println!("found item at group_idx: {} idx: {}", update_group_idx, idx_in_group);
-        unsafe {
-          return Some(&self.groups[update_group_idx].items[idx_in_group].assume_init_ref().value);
+        // println!("found item at group_idx: {} idx: {}", update_group_idx, idx_in_group);
+        let item: &Item<K, V> = unsafe { self.groups[update_group_idx].items[idx_in_group].assume_init_ref() };
+        if item.key == *key { // double check the key
+          return Some(&item.value);
+        } else {
+          // Resolve the in-group collision of h2
+          // TODO: Use SIMD to find the item
+          // println!("resolving in-group collision of h2, view: {:?}", view);
+          for i in 0..GROUP_SIZE {
+            let control_byte = view[i];
+            if control_byte == h2(hash) {
+              let item: &Item<K, V> = unsafe { self.groups[update_group_idx].items[i].assume_init_ref() };
+              if item.key == *key {
+                return Some(&item.value);
+              }
+            }
+          }
         }
-      } else {
-        // Item not found, check if the group is full
-        println!("item not found in group_idx: {}", current_control_byte_idx / GROUP_SIZE);
-        let empty_idx = self.probe_empty(view);
-        if let Some(empty_idx) = empty_idx {
-          // Found an empty slot, item is not in the table
-          println!("found empty slot at group_idx: {} idx: {}, early exit", current_control_byte_idx / GROUP_SIZE, empty_idx);
-          return None;
-        }
-        // No empty slot found, this group is full, continue to the next group
       }
-      // Move to the next group
+
+      // Item not found, check if the group is full
+      // println!("item not found in group_idx: {}, view: {:?}", current_control_byte_idx / GROUP_SIZE, view);
+      let empty_idx = self.probe_empty(view);
+      if let Some(empty_idx) = empty_idx {
+        // Found an empty slot, item is not in the table
+        // println!("found empty slot at group_idx: {} idx: {}, early exit", current_control_byte_idx / GROUP_SIZE, empty_idx);
+        return None;
+      }
+      // No empty slot found, this group is full, continue to the next group
       current_control_byte_idx = (current_control_byte_idx + GROUP_SIZE) % self.control_bytes.len();
     }
   }
@@ -143,10 +156,19 @@ impl<K: Eq + Hash, V, R: BuildHasher + Clone> Table<K, V, R> {
   }
 
   fn grow(&mut self) {
-    self.capacity *= 2;
-    let new_groups: Vec<Group<K, V>> = (0..self.capacity / 16).map(|_| Group::new()).collect();
-    self.groups.extend(new_groups);
-    self.control_bytes.resize(self.capacity, 0);
+    let mut new_table = Table::new_with_capacity_and_hasher(self.capacity * 2, self.hasher.clone());
+
+    for (index, control_byte) in self.control_bytes.iter().enumerate() {
+      if *control_byte == EMPTY || *control_byte == DELETED {
+        continue;
+      }
+
+      let item = unsafe { self.groups[index / GROUP_SIZE].items[index % GROUP_SIZE].assume_init_read() };
+      // TODO: Insert with Hash
+      new_table.insert(item.key, item.value);
+    }
+
+    *self = new_table;
   }
 
   fn hash_u64<T: Hash>(&self, item: &T) -> u64 {
@@ -212,6 +234,8 @@ impl<'a, K: Eq + Hash, V, S: BuildHasher> Iterator for Iter<'a, K, V, S> {
 
         let mut current_control_byte_idx = self.current_group * GROUP_SIZE + self.current_index;
 
+        // TODO: Iterate by using SIMD
+
         while current_control_byte_idx < self.table.control_bytes.len() {
             
             while self.current_index < GROUP_SIZE {
@@ -252,6 +276,8 @@ impl<K: Eq + Hash, V, S: BuildHasher> Iterator for IntoIter<K, V, S> {
 
         let mut current_control_byte_idx = self.current_group * GROUP_SIZE + self.current_index;
 
+        // TODO: Iterate by using SIMD
+
         while current_control_byte_idx < self.table.control_bytes.len() {
             
             while self.current_index < GROUP_SIZE {
@@ -259,10 +285,11 @@ impl<K: Eq + Hash, V, S: BuildHasher> Iterator for IntoIter<K, V, S> {
                 
                 // Skip empty slots or deleted slots
                 if control_byte != EMPTY && control_byte != DELETED {
-                    self.items_yielded += 1;
-                    // Check whether the item has been copied or not
-                    let item = unsafe { self.table.groups[self.current_group].items[self.current_index].assume_init_read() };
-                    return Some((item.key, item.value));
+                  // Check whether the item has been copied or not
+                  let item = unsafe { self.table.groups[self.current_group].items[self.current_index].assume_init_read() };
+                  self.current_index += 1;
+                  self.items_yielded += 1;
+                  return Some((item.key, item.value));
                 }
 
                 self.current_index += 1;
@@ -313,4 +340,66 @@ fn h2(hash: u64) -> u8 {
 
 fn round_up_to_nearest_multiple_of_16(n: usize) -> usize {
   (n + 15) & !15
+}
+
+#[cfg(test)]
+mod tests {
+
+  use super::*;
+
+  #[test]
+  fn test_round_up_to_nearest_multiple_of_16() {
+    assert_eq!(round_up_to_nearest_multiple_of_16(0), 0);
+    assert_eq!(round_up_to_nearest_multiple_of_16(1), 16);
+    assert_eq!(round_up_to_nearest_multiple_of_16(16), 16);
+    assert_eq!(round_up_to_nearest_multiple_of_16(17), 32);
+  }
+
+  #[test]
+  fn test_h1() {
+    assert_eq!(h1(0x01FFFFFFFFFFFFFF), 0x01FFFFFFFFFFFFFF);
+    assert_eq!(h1(0x0200000000000000), 0x01FFFFFFFFFFFFFF);
+  }
+
+  #[test]
+  fn test_h2() {
+    assert_eq!(h2(0x01FFFFFFFFFFFFFF), 0x01);
+    assert_eq!(h2(0x0200000000000000), 0x02);
+  }
+
+  #[test]
+  fn test_insert() {
+    let mut table = Table::<u64, u64>::new();
+    
+    table.insert(114514, 1919810);
+    assert_eq!(table.get(&114514), Some(&1919810));
+  }
+  
+  #[test]
+  fn test_bulk_insert_and_get() {
+    let mut table = Table::<u64, u64>::new_with_capacity(16);
+    let mut expected_data = Vec::new();
+    
+    // Generate random key-value pairs and insert them
+    for i in 0..500 {
+      let key = i * 3 + 7;
+      let value = i * 7 + 3;
+      table.insert(key, value);
+      expected_data.push((key, value));
+    }
+    
+    // Validate all data was inserted correctly
+    for (key, expected_value) in expected_data {
+      assert_eq!(table.get(&key), Some(&expected_value), "Failed to get correct value for key {}", key);
+    }
+    
+    // Validate non-existent keys return None
+    for i in 0..100 {
+      let key = 10000 + i;  // Keys we didn't insert
+      assert_eq!(table.get(&key), None, "Expected None for non-existent key {}", key);
+    }
+  }
+  
+
+  
 }
